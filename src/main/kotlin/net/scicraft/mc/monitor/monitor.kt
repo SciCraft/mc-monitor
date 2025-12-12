@@ -2,6 +2,7 @@ package net.scicraft.mc.monitor
 
 import com.sun.tools.attach.VirtualMachine
 import com.sun.tools.attach.VirtualMachineDescriptor
+import com.sun.tools.attach.spi.AttachProvider
 import io.prometheus.client.Collector
 import io.prometheus.client.CollectorRegistry
 import io.prometheus.client.GaugeMetricFamily
@@ -15,10 +16,7 @@ import java.lang.management.ManagementFactory
 import java.lang.management.MemoryMXBean
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.file.FileVisitResult
-import java.nio.file.Files
-import java.nio.file.Path
-import java.nio.file.SimpleFileVisitor
+import java.nio.file.*
 import java.nio.file.attribute.BasicFileAttributes
 import java.time.Duration
 import java.time.Instant
@@ -27,6 +25,8 @@ import java.util.*
 import javax.management.ObjectName
 import javax.management.remote.JMXConnectorFactory
 import javax.management.remote.JMXServiceURL
+import kotlin.io.path.Path
+import kotlin.io.path.name
 
 val BASE_PATH: Path = Path.of(System.getProperty("user.home"))
 
@@ -93,35 +93,54 @@ object McMonitorCollector : Collector() {
     }
 }
 
+fun getOfflineStatus(dir: Path): Offline? {
+    val serverPropsPath = dir.resolve("server.properties")
+    if (!Files.exists(serverPropsPath)) return null
+    val props = Properties()
+    Files.newInputStream(serverPropsPath).use { props.load(it) }
+    val worldDir = dir.resolve(props.getProperty("level-name", "world"))
+    val worldSize = getDiskUsage(worldDir)
+    return Offline(ServerData(dir, props, worldSize))
+}
+
+data class OnlineDescriptor(val pid: Int, val cwd: Path, val vm: VirtualMachineDescriptor?)
+
+fun getRunningServers(): Set<OnlineDescriptor> {
+    val provider = AttachProvider.providers()[0]
+    val servers = mutableSetOf<OnlineDescriptor>()
+    val vms = VirtualMachine.list().associateBy { it.id().toInt() }
+    Files.list(Path("/proc")).use {
+        for (path in it) {
+            val pid = path.name.toIntOrNull() ?: continue
+            if (Files.getOwner(path).name != "minecraft") continue
+            try {
+                if (!Files.readSymbolicLink(path.resolve("exe")).name.startsWith("java")) continue
+                val cwd = Files.readSymbolicLink(path.resolve("cwd"))
+                if (!Files.exists(cwd.resolve("server.properties"))) continue
+                servers.add(OnlineDescriptor(pid, cwd, vms[pid] ?: VirtualMachineDescriptor(provider, pid.toString())))
+            } catch (_: AccessDeniedException) {}
+        }
+    }
+    return servers
+}
 
 fun queryServers(): Map<String, ServerStatus> {
     val statuses = sortedMapOf<Path, ServerStatus>()
     Files.list(BASE_PATH).use { dirStream ->
         for (dir in dirStream) {
-            val serverPropsPath = dir.resolve("server.properties")
-            if (!Files.exists(serverPropsPath)) continue
-            val props = Properties()
-            Files.newInputStream(serverPropsPath).use { props.load(it) }
-            val worldDir = dir.resolve(props.getProperty("level-name", "world"))
-            val worldSize = getDiskUsage(worldDir)
-            statuses[dir] = Offline(ServerData(dir, props, worldSize))
+            statuses[dir] = getOfflineStatus(dir) ?: continue
         }
     }
-    val vms = VirtualMachine.list()
-    for (vm in vms) {
-        val pid = vm.id()
-        val cwd = try {
-            Files.readSymbolicLink(Path.of("/proc/$pid/cwd"))
-        } catch (e: IOException) {
-            continue
-        }
-        if (cwd !in statuses) continue
+    for ((pid, cwd, vm) in getRunningServers()) {
+        if (cwd !in statuses) statuses[cwd] = getOfflineStatus(cwd) ?: continue
         val data = statuses[cwd]!!.data
-        val jmxData = try {
-            getOnlineServerStatus(vm)
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
+        val jmxData = vm?.let {
+            try {
+                getOnlineServerStatus(vm)
+            } catch (e: Exception) {
+                e.printStackTrace()
+                null
+            }
         }
         val startTime = Files.getLastModifiedTime(Path.of("/proc/$pid")).toInstant()
         val port = data.properties.getProperty("server-port", "25565").toInt()
@@ -131,12 +150,13 @@ fun queryServers(): Map<String, ServerStatus> {
             e.printStackTrace()
             null
         }
-        statuses[cwd] = Online(data, pid.toInt(), startTime, jmxData, pingData)
+        statuses[cwd] = Online(data, pid, startTime, jmxData, pingData)
     }
     return statuses.mapKeys { it.key.fileName.toString() }
 }
 
 fun getDiskUsage(path: Path): Long {
+    if (!Files.exists(path)) return 0
     var size = 0L
     Files.walkFileTree(path, object : SimpleFileVisitor<Path>() {
         override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
